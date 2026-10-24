@@ -1,0 +1,23 @@
+{
+  "name": "Bingus Shared Loader",
+  "revision": "loader-v21",
+  "display_version": "v21",
+  "steam_build": 26088801,
+  "supported_steam_builds": [
+    25988413,
+    26088801
+  ],
+  "exe_version": "1.8.46659.0",
+  "runtime_verified": true,
+  "files": {
+    "data/9ba626afa44a3aa3.patch_0": "C543B42E3F7746479C8465745700A980D766B78696B70F158C68E9214799903D",
+    "data/9ba626afa44a3aa3.patch_0.stream": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+    "data/9ba626afa44a3aa3.patch_0.gpu_resources": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+    "BingusSharedLoader-README.txt": "C59BDA0C7FDEDC1560DABB452C547EC012BDF7AD2859FADE2520CF84C7BDDE5A",
+    "thumbnail.png": "C8C7901C5C71BF2F8D7CF6D83BD0F916244CA2508B1D39824FA9B66B79BED7CC"
+  },
+  "provides": {
+    "shared_loader_api": 1,
+    "addon_discovery": 1
+  }
+}

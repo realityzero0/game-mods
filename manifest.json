@@ -1,0 +1,17 @@
+{
+  "Version": 1,
+  "Guid": "612eaf70-d682-43c7-9efd-16dcc695f977",
+  "Name": "Bingus Shared Loader - v21",
+  "Description": "Modernized boot loader for Helldivers 2 builds 25988413 & 26088801+ (Lua 5.1).",
+  "Options": [
+    {
+      "Name": "Bingus Shared Loader - v21",
+      "Description": "Modernized boot loader for Helldivers 2 builds 25988413 & 26088801+ (Lua 5.1).",
+      "Include": [
+        "data"
+      ],
+      "Image": "thumbnail.png"
+    }
+  ],
+  "IconPath": "thumbnail.png"
+}
