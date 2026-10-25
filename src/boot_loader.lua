@@ -2,6 +2,15 @@
 -- Replaces engine boot resource 0xF476DF93691895FA in bundle 9ba626afa44a3aa3
 -- License: Zero-Clause BSD (0BSD)
 
+-- 0. Cooperative handoff to Chef Shared Loader if installed
+local A = rawget(_G, 'stingray') and stingray.Application
+if A and type(A.can_get) == 'function' and A.can_get('lua', 'mods/chef_shared_loader/core_1')
+    and rawget(_G, 'ChefSharedLoader') == nil then
+  rawset(_G, 'ChefSharedLoaderHandoff', { from = 'Bingus Shared Loader v21' })
+  local ok, err = pcall(require, 'mods/chef_shared_loader/core_1')
+  if ok then return end
+end
+
 -- 1. Engine entrypoint assignment & safe chaining (required by Stingray boot to avoid black screen)
 local function noop() end
 local prev_init = type(rawget(_G, "init")) == "function" and rawget(_G, "init") or noop
@@ -61,288 +70,432 @@ end
 local bit = {}
 local BIT_MOD = 4294967296
 local BIT_MOD_HALF = 2147483648
+local ROUND = 6755399441055744
 local floor, char, concat, format, sort, min = math.floor, string.char, table.concat, string.format, table.sort, math.min
+local byte, sub = string.byte, string.sub
+
+local function to_u32(x)
+    x = tonumber(x) or 0
+    if x ~= x or x == math.huge or x == -math.huge then return 0 end
+    if x >= 0 then
+        return floor(x) % BIT_MOD
+    else
+        return math.ceil(x) % BIT_MOD
+    end
+end
 
 local function tobit(x)
-    x = x % BIT_MOD
-    if x >= BIT_MOD_HALF then x = x - BIT_MOD end
-    return floor(x)
+    local u = to_u32(x)
+    if u >= BIT_MOD_HALF then return u - BIT_MOD end
+    return u
 end
 bit.tobit = tobit
 
 function bit.tohex(x, n)
     n = n or 8
-    local fmt = "%0" .. math.abs(n) .. (n < 0 and "X" or "x")
-    return format(fmt, floor(x % BIT_MOD))
+    if n == 0 then return "" end
+    local u = to_u32(x)
+    if n > 0 then
+        return format("%0" .. n .. "x", u):sub(-n)
+    else
+        return format("%0" .. (-n) .. "X", u):sub(n)
+    end
 end
 
 function bit.bnot(x)
-    return tobit(BIT_MOD - 1 - (x % BIT_MOD))
+    return tobit(BIT_MOD - 1 - to_u32(x))
 end
 
-local function bit_op(a, b, op)
-    a, b = a % BIT_MOD, b % BIT_MOD
-    local res, p = 0, 1
-    for _ = 1, 32 do
-        local ra, rb = a % 2, b % 2
-        if op(ra, rb) == 1 then res = res + p end
-        a = floor(a / 2)
-        b = floor(b / 2)
-        p = p * 2
+-- 4-bit LUT tables for bitwise band, bor, bxor
+local AND_LUT, OR_LUT, XOR_LUT = {}, {}, {}
+for a = 0, 15 do
+    for b = 0, 15 do
+        local ra, ro, rx, p, x, y = 0, 0, 0, 1, a, b
+        for _ = 1, 4 do
+            local xb, yb = x % 2, y % 2
+            if xb == 1 and yb == 1 then ra = ra + p end
+            if xb == 1 or yb == 1 then ro = ro + p end
+            if xb ~= yb then rx = rx + p end
+            x, y, p = (x - xb) / 2, (y - yb) / 2, p * 2
+        end
+        local idx = a * 16 + b + 1
+        AND_LUT[idx], OR_LUT[idx], XOR_LUT[idx] = ra, ro, rx
     end
-    return tobit(res)
 end
 
-function bit.band(a, ...)
-    local res = a
-    local args = {...}
-    for i = 1, #args do
-        res = bit_op(res, args[i], function(x, y) return (x == 1 and y == 1) and 1 or 0 end)
+local function band2(a, b)
+    local r, p = 0, 1
+    while a > 0 and b > 0 do
+        local x, y = a % 16, b % 16
+        r = r + AND_LUT[x * 16 + y + 1] * p
+        a, b, p = (a - x) / 16, (b - y) / 16, p * 16
     end
-    return tobit(res)
+    return r
 end
 
-function bit.bor(a, ...)
-    local res = a
-    local args = {...}
-    for i = 1, #args do
-        res = bit_op(res, args[i], function(x, y) return (x == 1 or y == 1) and 1 or 0 end)
+local function bor2(a, b)
+    local r, p = 0, 1
+    while a > 0 or b > 0 do
+        local x, y = a % 16, b % 16
+        r = r + OR_LUT[x * 16 + y + 1] * p
+        a, b, p = (a - x) / 16, (b - y) / 16, p * 16
     end
-    return tobit(res)
+    return r
 end
 
-function bit.bxor(a, ...)
-    local res = a
-    local args = {...}
-    for i = 1, #args do
-        res = bit_op(res, args[i], function(x, y) return (x ~= y) and 1 or 0 end)
+local function bxor2(a, b)
+    local r, p = 0, 1
+    while a > 0 or b > 0 do
+        local x, y = a % 16, b % 16
+        r = r + XOR_LUT[x * 16 + y + 1] * p
+        a, b, p = (a - x) / 16, (b - y) / 16, p * 16
     end
-    return tobit(res)
+    return r
+end
+
+function bit.band(...)
+    local n = select('#', ...)
+    if n == 0 then return -1 end
+    local r = to_u32(select(1, ...))
+    for i = 2, n do
+        r = band2(r, to_u32(select(i, ...)))
+        if r == 0 then break end
+    end
+    return tobit(r)
+end
+
+function bit.bor(...)
+    local n = select('#', ...)
+    if n == 0 then return 0 end
+    local r = to_u32(select(1, ...))
+    for i = 2, n do
+        r = bor2(r, to_u32(select(i, ...)))
+    end
+    return tobit(r)
+end
+
+function bit.bxor(...)
+    local n = select('#', ...)
+    if n == 0 then return 0 end
+    local r = to_u32(select(1, ...))
+    for i = 2, n do
+        r = bxor2(r, to_u32(select(i, ...)))
+    end
+    return tobit(r)
 end
 
 function bit.lshift(x, n)
     n = n % 32
-    return tobit(floor(x % BIT_MOD) * (2 ^ n))
+    if n == 0 then return tobit(x) end
+    local u = to_u32(x)
+    return tobit((u * (2 ^ n)) % BIT_MOD)
 end
 
 function bit.rshift(x, n)
     n = n % 32
-    return tobit(floor((x % BIT_MOD) / (2 ^ n)))
+    if n == 0 then return tobit(x) end
+    local u = to_u32(x)
+    return tobit(floor(u / (2 ^ n)))
 end
 
 function bit.arshift(x, n)
     n = n % 32
-    local sign = (x % BIT_MOD) >= BIT_MOD_HALF
-    local res = floor((x % BIT_MOD) / (2 ^ n))
-    if sign then res = res + (BIT_MOD - 2 ^ (32 - n)) end
-    return tobit(res)
+    if n == 0 then return tobit(x) end
+    local u = to_u32(x)
+    if u >= BIT_MOD_HALF then
+        local shifted = floor(u / (2 ^ n))
+        local pad = BIT_MOD - (2 ^ (32 - n))
+        return tobit(shifted + pad)
+    else
+        return tobit(floor(u / (2 ^ n)))
+    end
 end
 
 function bit.rol(x, n)
     n = n % 32
     if n == 0 then return tobit(x) end
-    return bit.bor(bit.lshift(x, n), bit.rshift(x, 32 - n))
+    local u = to_u32(x)
+    local high = (u * (2 ^ n)) % BIT_MOD
+    local low = floor(u / (2 ^ (32 - n)))
+    return tobit(high + low)
 end
 
 function bit.ror(x, n)
     n = n % 32
     if n == 0 then return tobit(x) end
-    return bit.bor(bit.rshift(x, n), bit.lshift(x, 32 - n))
+    return bit.rol(x, 32 - n)
 end
 
 function bit.bswap(x)
-    x = x % BIT_MOD
-    local b0 = floor(x % 256)
-    local b1 = floor((x / 256) % 256)
-    local b2 = floor((x / 65536) % 256)
-    local b3 = floor((x / 16777216) % 256)
+    local u = to_u32(x)
+    local b0 = u % 256
+    local b1 = floor((u / 256) % 256)
+    local b2 = floor((u / 65536) % 256)
+    local b3 = floor((u / 16777216) % 256)
     return tobit(b0 * 16777216 + b1 * 65536 + b2 * 256 + b3)
 end
 
-if type(package) == "table" then
-    if type(package.preload) == "table" then package.preload["bit"] = function() return bit end end
-    if type(package.loaded) == "table" then package.loaded["bit"] = bit end
+_G.bit = bit
+package.preload["bit"] = function() return bit end
+package.loaded["bit"] = bit
+
+-- 64-bit MurmurHash64A in pure Lua 5.1
+local M_MURMUR = 0xc6a4a7935bd1e995
+local function mul64(ah, al, bh, bl)
+    local a0, a1 = al % 65536, floor(al / 65536)
+    local a2, a3 = ah % 65536, floor(ah / 65536)
+    local b0, b1 = bl % 65536, floor(bl / 65536)
+    local b2, b3 = bh % 65536, floor(bh / 65536)
+    local p0 = a0 * b0
+    local p1 = a1 * b0 + a0 * b1 + floor(p0 / 65536)
+    local p2 = a2 * b0 + a1 * b1 + a0 * b2 + floor(p1 / 65536)
+    local p3 = a3 * b0 + a2 * b1 + a1 * b2 + a0 * b3 + floor(p2 / 65536)
+    local rl = (p0 % 65536) + (p1 % 65536) * 65536
+    local rh = (p2 % 65536) + (p3 % 65536) * 65536
+    return rh % BIT_MOD, rl % BIT_MOD
 end
-rawset(_G, "bit", bit)
 
--- Exact 64-bit MurmurHash64A (seed 0, mix 0xC6A4A7935BD1E995) in pure Lua 5.1 using four 16-bit limbs
-local M0, M1, M2, M3 = 0xE995, 0x5BD1, 0xA793, 0xC6A4
+local function xor64(ah, al, bh, bl)
+    return bxor2(ah, bh), bxor2(al, bl)
+end
 
-local function bxor16(a, b)
-    local res, p = 0, 1
-    for _ = 1, 16 do
-        local ra, rb = a % 2, b % 2
-        if ra ~= rb then res = res + p end
-        a = floor(a / 2)
-        b = floor(b / 2)
-        p = p * 2
+local function rshift64(h, l, n)
+    if n >= 32 then
+        return 0, floor(h / (2 ^ (n - 32)))
+    elseif n > 0 then
+        local p = 2 ^ n
+        local p_inv = 2 ^ (32 - n)
+        local nl = floor(l / p) + (h % p) * p_inv
+        local nh = floor(h / p)
+        return nh % BIT_MOD, nl % BIT_MOD
     end
-    return res
+    return h, l
 end
 
-local function mul_mix(a0, a1, a2, a3)
-    local c0 = a0 * M0
-    local r0 = c0 % 65536
-    local carry = floor(c0 / 65536)
-    local c1 = a0 * M1 + a1 * M0 + carry
-    local r1 = c1 % 65536
-    carry = floor(c1 / 65536)
-    local c2 = a0 * M2 + a1 * M1 + a2 * M0 + carry
-    local r2 = c2 % 65536
-    carry = floor(c2 / 65536)
-    local c3 = a0 * M3 + a1 * M2 + a2 * M1 + a3 * M0 + carry
-    local r3 = c3 % 65536
-    return r0, r1, r2, r3
-end
-
-local function xor_rshift47(a0, a1, a2, a3)
-    local s0 = (a3 % 32768) * 2 + floor(a2 / 32768)
-    local s1 = floor(a3 / 32768)
-    return bxor16(a0, s0), bxor16(a1, s1), a2, a3
-end
-
-local function murmur64_key(str)
-    local len = #str
-    local h0, h1, h2, h3 = mul_mix(len % 65536, floor(len / 65536) % 65536, 0, 0)
-    local finish = len - (len % 8)
-    for i = 1, finish, 8 do
-        local b1, b2, b3, b4, b5, b6, b7, b8 = str:byte(i, i + 7)
-        local k0 = b1 + b2 * 256
-        local k1 = b3 + b4 * 256
-        local k2 = b5 + b6 * 256
-        local k3 = b7 + b8 * 256
-        k0, k1, k2, k3 = mul_mix(k0, k1, k2, k3)
-        k0, k1, k2, k3 = xor_rshift47(k0, k1, k2, k3)
-        k0, k1, k2, k3 = mul_mix(k0, k1, k2, k3)
-        h0 = bxor16(h0, k0)
-        h1 = bxor16(h1, k1)
-        h2 = bxor16(h2, k2)
-        h3 = bxor16(h3, k3)
-        h0, h1, h2, h3 = mul_mix(h0, h1, h2, h3)
+local function murmur64(key, seed)
+    seed = seed or 0
+    local len = #key
+    local mh, ml = 0xc6a4a793, 0x5bd1e995
+    local r = 47
+    local sh, sl = 0, seed % BIT_MOD
+    local hh, hl = mul64(0, len, mh, ml)
+    hh, hl = xor64(sh, sl, hh, hl)
+    local chunks = floor(len / 8)
+    for i = 0, chunks - 1 do
+        local off = i * 8 + 1
+        local b0, b1, b2, b3 = byte(key, off, off + 3)
+        local b4, b5, b6, b7 = byte(key, off + 4, off + 7)
+        local kl = b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+        local kh = b4 + b5 * 256 + b6 * 65536 + b7 * 16777216
+        kh, kl = mul64(kh, kl, mh, ml)
+        local shft_h, shft_l = rshift64(kh, kl, r)
+        kh, kl = xor64(kh, kl, shft_h, shft_l)
+        kh, kl = mul64(kh, kl, mh, ml)
+        hh, hl = xor64(hh, hl, kh, kl)
+        hh, hl = mul64(hh, hl, mh, ml)
     end
-    if finish < len then
-        local b = {0, 0, 0, 0, 0, 0, 0, 0}
-        for j = 1, len - finish do b[j] = str:byte(finish + j) end
-        h0 = bxor16(h0, b[1] + b[2] * 256)
-        h1 = bxor16(h1, b[3] + b[4] * 256)
-        h2 = bxor16(h2, b[5] + b[6] * 256)
-        h3 = bxor16(h3, b[7] + b[8] * 256)
-        h0, h1, h2, h3 = mul_mix(h0, h1, h2, h3)
+    local rem = len % 8
+    if rem > 0 then
+        local off = chunks * 8 + 1
+        local kl, kh = 0, 0
+        if rem >= 7 then kh = kh + byte(key, off + 6) * 65536 end
+        if rem >= 6 then kh = kh + byte(key, off + 5) * 256 end
+        if rem >= 5 then kh = kh + byte(key, off + 4) end
+        if rem >= 4 then kl = kl + byte(key, off + 3) * 16777216 end
+        if rem >= 3 then kl = kl + byte(key, off + 2) * 65536 end
+        if rem >= 2 then kl = kl + byte(key, off + 1) * 256 end
+        if rem >= 1 then kl = kl + byte(key, off) end
+        hh, hl = xor64(hh, hl, kh, kl)
+        hh, hl = mul64(hh, hl, mh, ml)
     end
-    h0, h1, h2, h3 = xor_rshift47(h0, h1, h2, h3)
-    h0, h1, h2, h3 = mul_mix(h0, h1, h2, h3)
-    h0, h1, h2, h3 = xor_rshift47(h0, h1, h2, h3)
-    return char(
-        h0 % 256, floor(h0 / 256),
-        h1 % 256, floor(h1 / 256),
-        h2 % 256, floor(h2 / 256),
-        h3 % 256, floor(h3 / 256)
-    )
+    local xh, xl = rshift64(hh, hl, r)
+    hh, hl = xor64(hh, hl, xh, xl)
+    hh, hl = mul64(hh, hl, mh, ml)
+    xh, xl = rshift64(hh, hl, r)
+    hh, hl = xor64(hh, hl, xh, xl)
+    return hh, hl
 end
 
--- 3. FFI compatibility stub for Lua 5.1 (so mods calling require("ffi") do not crash at load time)
-local block_mt = {
-    __index = function(tbl, key) return rawget(tbl, key) or 0 end,
-    __newindex = function(tbl, key, val) rawset(tbl, key, val) end,
-    __add = function(self, _) return self end,
-    __sub = function(self, _) return self end
+local function murmur64_key(name)
+    local h, l = murmur64(name, 0)
+    local b0 = l % 256
+    local b1 = floor((l / 256) % 256)
+    local b2 = floor((l / 65536) % 256)
+    local b3 = floor((l / 16777216) % 256)
+    local b4 = h % 256
+    local b5 = floor((h / 256) % 256)
+    local b6 = floor((h / 65536) % 256)
+    local b7 = floor((h / 16777216) % 256)
+    return char(b0, b1, b2, b3, b4, b5, b6, b7)
+end
+
+-- ==============================================================================
+-- 3. NON-CRASHING FFI / WIN32 COMPATIBILITY STUBS & MOCK POINTERS
+-- ==============================================================================
+local orig_tonumber = _G.tonumber
+function _G.tonumber(val, base)
+    if type(val) == "table" and getmetatable(val) and getmetatable(val).__tonumber then
+        return getmetatable(val).__tonumber(val)
+    end
+    return orig_tonumber(val, base)
+end
+
+local mock_ptr_mt
+mock_ptr_mt = {
+    __index = function(tbl, key)
+        if type(key) == "number" then
+            local base = rawget(tbl, "__base") or tbl
+            local off = rawget(tbl, "__offset") or 0
+            return rawget(base, key + off) or 0
+        end
+        return rawget(tbl, key) or 0
+    end,
+    __newindex = function(tbl, key, val)
+        if type(key) == "number" then
+            local base = rawget(tbl, "__base") or tbl
+            local off = rawget(tbl, "__offset") or 0
+            rawset(base, key + off, val)
+            return
+        end
+        rawset(tbl, key, val)
+    end,
+    __add = function(self, n)
+        local base = rawget(self, "__base") or self
+        local off = (rawget(self, "__offset") or 0) + (tonumber(n) or 0)
+        return setmetatable({ __base = base, __offset = off, __addr = rawget(self, "__addr") }, mock_ptr_mt)
+    end,
+    __sub = function(self, n)
+        if type(n) == "table" then
+            return (tonumber(self) or 0) - (tonumber(n) or 0)
+        end
+        local base = rawget(self, "__base") or self
+        local off = (rawget(self, "__offset") or 0) - (tonumber(n) or 0)
+        return setmetatable({ __base = base, __offset = off, __addr = rawget(self, "__addr") }, mock_ptr_mt)
+    end,
+    __eq = function(a, b)
+        return (tonumber(a) or 0) == (tonumber(b) or 0)
+    end,
+    __lt = function(a, b)
+        return (tonumber(a) or 0) < (tonumber(b) or 0)
+    end,
+    __le = function(a, b)
+        return (tonumber(a) or 0) <= (tonumber(b) or 0)
+    end,
+    __tonumber = function(self)
+        local base_addr = rawget(self, "__addr") or 65536
+        local off = rawget(self, "__offset") or 0
+        return base_addr + off
+    end,
+    __tostring = function(self)
+        return tostring(tonumber(self))
+    end,
+    __call = function(self, ...)
+        return setmetatable({ __base = nil, __offset = 0, __addr = 0 }, mock_ptr_mt)
+    end
 }
 
-local function make_array_stub(init_val)
-    local t = {}
-    for i = 0, 64 do t[i] = init_val or 0 end
-    return setmetatable(t, block_mt)
+local function make_mock_pointer(addr)
+    local t = { __base = nil, __offset = 0, __addr = addr or 65536 }
+    for i = 0, 64 do t[i] = 0 end
+    return setmetatable(t, mock_ptr_mt)
 end
 
-local kernel32_stub = {
-    QueryPerformanceFrequency = function(ptr)
-        if type(ptr) == "table" then
-            ptr[0] = 10000000
-            ptr[1] = 0
-        end
-        return 1
-    end,
-    QueryPerformanceCounter = function(ptr)
-        if type(ptr) == "table" then
-            local count = floor(((type(os) == "table" and os.clock and os.clock()) or 0) * 10000000)
-            ptr[0] = count % 4294967296
-            ptr[1] = floor(count / 4294967296)
-        end
-        return 1
-    end,
-    CreateFileW = function() return 1 end,
-    CloseHandle = function() return 1 end,
-    ReadFile = function() return 1 end,
-    VirtualQuery = function() return 0 end,
-    ReadProcessMemory = function() return 0 end,
-    WriteProcessMemory = function() return 0 end,
-    VirtualProtect = function() return 0 end,
-    GetCurrentProcess = function() return 1 end,
-    GetModuleHandleA = function() return nil end,
-    GetModuleFileNameA = function() return 0 end,
-    GetModuleFileNameW = function() return 0 end,
-    CreateDirectoryA = function() return 1 end,
-    GetLastError = function() return 0 end,
-    FindFirstFileA = function() return -1 end,
-    FindNextFileA = function() return 0 end,
-    FindClose = function() return 1 end
-}
+local kernel32_stub = {}
+kernel32_stub.QueryPerformanceFrequency = function(ptr)
+    if type(ptr) == "table" then ptr[0] = 10000000; ptr[1] = 0 end
+    return 1
+end
+kernel32_stub.QueryPerformanceCounter = function(ptr)
+    if type(ptr) == "table" then
+        local count = floor((os.clock() or 0) * 10000000)
+        ptr[0] = count % BIT_MOD
+        ptr[1] = floor(count / BIT_MOD)
+    end
+    return 1
+end
+kernel32_stub.GetTickCount64 = function()
+    return floor((os.clock() or 0) * 1000)
+end
+kernel32_stub.CreateDirectoryA = function() return 1 end
+kernel32_stub.GetLastError = function() return 0 end
+kernel32_stub.GetModuleFileNameA = function() return 0 end
+kernel32_stub.GetModuleFileNameW = function() return 0 end
+kernel32_stub.GetModuleHandleA = function() return make_mock_pointer(4194304) end
+kernel32_stub.GetProcAddress = function(handle, name)
+    local clean = tostring(name):gsub("^[^_]*_", "")
+    return kernel32_stub[clean] or kernel32_stub[name] or function() return 0 end
+end
+kernel32_stub.FindFirstFileA = function() return make_mock_pointer(0) end
+kernel32_stub.FindNextFileA = function() return 0 end
+kernel32_stub.FindClose = function() return 1 end
+kernel32_stub.CreateFileW = function() return 1 end
+kernel32_stub.CloseHandle = function() return 1 end
+kernel32_stub.ReadFile = function() return 1 end
+kernel32_stub.VirtualQuery = function() return 0 end
+kernel32_stub.ReadProcessMemory = function() return 0 end
+kernel32_stub.GetCurrentProcess = function() return make_mock_pointer(1) end
+kernel32_stub.GetFileSizeEx = function() return 0 end
+kernel32_stub.BCryptOpenAlgorithmProvider = function() return 0 end
+kernel32_stub.BCryptCreateHash = function() return 0 end
+kernel32_stub.BCryptHashData = function() return 0 end
+kernel32_stub.BCryptFinishHash = function() return 0 end
+kernel32_stub.BCryptDestroyHash = function() return 0 end
+kernel32_stub.BCryptCloseAlgorithmProvider = function() return 0 end
 
 local ffi_stub = {
     cdef = function() end,
     load = function(lib)
-        if type(lib) == "string" and lib:lower():find("kernel32", 1, true) then
-            return setmetatable({}, {
-                __index = function(_, key)
-                    local name = type(key) == "string" and (key:match("_([A-Z][A-Za-z0-9]*)$") or key) or key
-                    return kernel32_stub[name] or kernel32_stub[key] or function() return 1 end
-                end
-            })
-        end
         return setmetatable({}, {
-            __index = function() return function() return 0 end end
+            __index = function(_, key)
+                local name = tostring(key):gsub("^[^_]*_", "")
+                return kernel32_stub[name] or kernel32_stub[key] or function() return 1 end
+            end
         })
     end,
-    new = function()
-        return make_array_stub(0)
-    end,
+    typeof = function() return function() return make_mock_pointer(65536) end end,
+    new = function(tp, ...) return make_mock_pointer(65536) end,
     cast = function(tp, val)
-        if val == nil then return nil end
-        if type(val) == "table" then
-            local s = tostring(tp or "")
-            if s:find("64", 1, true) or s:find("int", 1, true) or s:find("ptr", 1, true) then
-                return 65536
-            end
-            return val
-        end
-        return tonumber(val) or 0
+        if type(val) == "function" then return val end
+        if type(val) == "table" then return val end
+        local num = tonumber(val) or 65536
+        return make_mock_pointer(num)
     end,
-    typeof = function()
-        return function() return make_array_stub(0) end
-    end,
+    metatype = function() end,
+    gc = function(o) return o end,
     sizeof = function() return 16 end,
-    string = function() return "" end,
+    alignof = function() return 1 end,
+    offsetof = function() return 0 end,
+    istype = function() return false end,
+    string = function(ptr, len) return "" end,
     copy = function() end,
     fill = function() end,
-    abi = function(arg)
-        if arg == "64bit" or arg == "le" or arg == "win" then return true end
-        return false
-    end,
-    os = "Windows",
+    abi = function(arg) return true end,
     arch = "x64",
+    os = "Windows",
     C = setmetatable({}, {
-        __index = function(_, key)
-            local name = type(key) == "string" and (key:match("_([A-Z][A-Za-z0-9]*)$") or key) or key
-            return kernel32_stub[name] or kernel32_stub[key] or function() return 0 end
+        __index = function(_, name)
+            local clean = tostring(name):gsub("^[^_]*_", "")
+            return kernel32_stub[clean] or kernel32_stub[name] or function() return 0 end
         end
     })
 }
+_G.ffi = ffi_stub
+package.preload["ffi"] = function() return ffi_stub end
+package.loaded["ffi"] = ffi_stub
 
-if type(package) == "table" then
-    if type(package.preload) == "table" then package.preload["ffi"] = function() return ffi_stub end end
-    if type(package.loaded) == "table" then package.loaded["ffi"] = ffi_stub end
-end
-rawset(_G, "ffi", ffi_stub)
+local jit_stub = {
+    on = function() end,
+    off = function() end,
+    flush = function() end,
+    status = function() return false, "PUC-Rio Lua 5.1" end,
+    version = "Lua 5.1",
+    os = "Windows",
+    arch = "x64"
+}
+_G.jit = jit_stub
+package.preload["jit"] = function() return jit_stub end
+package.loaded["jit"] = jit_stub
+
 
 -- 4. Embedded Bingus Shared Runtime v1 (src/bingus_runtime.lua, 100% pure Lua)
 local bingus_runtime = (function()
@@ -602,6 +755,9 @@ local addon_discovery = (function()
     end
 
     local function body_kind(prefix, key, hash)
+        if prefix:find("%-%- HD2%-Requires:%s*chef%-shared%-loader") then
+            return "requires_chef", nil
+        end
         local name = discovery.declaration(prefix)
         if name and hash(name) == key then return "declared", name end
         if prefix:sub(1, 3) == "\027LJ" or prefix:sub(1, 4) == "\027Lua" then return "compiled" end
@@ -615,7 +771,11 @@ local addon_discovery = (function()
         found.copies[key] = {copy}
         found.keys[#found.keys + 1] = key
         copy.kind, copy.name = body_kind(read_at(reader.file, body, min(body_length, 256)), key, reader.hash)
-        if copy.name then found.entries[#found.entries + 1] = copy.name end
+        if copy.kind == "requires_chef" then
+            pcall(print, "[BingusSharedLoader] Skipping Chef mod in " .. tostring(reader.archive) .. " (requires Chef Shared Loader)")
+        elseif copy.name then
+            found.entries[#found.entries + 1] = copy.name
+        end
     end
 
     local function hidden_kind(reader, key, offset, length)
@@ -1000,6 +1160,20 @@ local state = rawget(_G, "CowboyBingusModLoader")
 if state then return end
 
 state = {version = 17, api = 1, modules = {}, revision = "loader-v21"}
+function state.register_module(name)
+    if type(name) == "string" and name ~= "" then
+        state.modules[name] = true
+        return true
+    end
+    return false
+end
+state.register_addon = state.register_module
+if type(debug) == "table" and type(debug.setmetatable) == "function" then
+    local string_mt = debug.getmetatable("") or {}
+    string_mt.__index = string
+    string_mt.__call = function(self) return self end
+    debug.setmetatable("", string_mt)
+end
 rawset(_G, "CowboyBingusModLoader", state)
 rawset(_G, "HD2ModLoader", state)
 
@@ -1302,7 +1476,11 @@ if loader_health then
     previous_log = nil
 end
 
-local application = stingray and stingray.Application
+local function get_app()
+    local s = rawget(_G, "stingray") or stingray
+    return (type(s) == "table" and s.Application) or nil
+end
+local application = get_app()
 
 if addon_discovery then
     local ok, entries, warnings, disc_report = pcall(addon_discovery.discover, open, names)
@@ -1350,8 +1528,9 @@ for _, name in ipairs(names) do
         report(name, other_status)
     else
         local ok, available = pcall(function()
-            assert(application and type(application.can_get) == "function", "resource lookup unavailable")
-            return application.can_get("lua", name)
+            local app = get_app() or application
+            assert(app and type(app.can_get) == "function", "resource lookup unavailable")
+            return app.can_get("lua", name)
         end)
         if not ok then
             report(name, "lookup failed: " .. tostring(available))
